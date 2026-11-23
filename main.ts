@@ -1,81 +1,106 @@
-// ONE DAY ON EARTH - Monday 23 November 2026.
-// Node 22, standard library only. The front page is pre-drawn (entry.png,
-// 1024x1024, PIL) and this program copies it to the output directory after
-// checking it is a whole, valid PNG inside the competition's gate, then
-// writes a small deterministic dossier.json describing the entry.
+// ONE DAY ON EARTH — Monday 23 November 2026.
 //
-//   MAKEFUN_OUTPUT_DIR=out node main.ts
-import { createHash } from "node:crypto";
-import { copyFileSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+// Node 22, standard library only. The front page ships pre-drawn as
+// entry.png (1024x1024, produced by draw.py in this same directory).
+// This program makes sure the file is a complete, valid PNG inside the
+// competition's size gate, copies it into the output directory, and
+// leaves a small deterministic dossier.json next to it describing the
+// entry.
+//
+// Run it as: MAKEFUN_OUTPUT_DIR=out node main.ts
 
-const here = dirname(fileURLToPath(import.meta.url));
-const src = join(here, "entry.png");
-const outDir = process.env.MAKEFUN_OUTPUT_DIR ?? "/output";
+import { createHash as hashOf } from "node:crypto";
+import {
+  copyFileSync as copy,
+  mkdirSync as mkdir,
+  readFileSync as read,
+  statSync as stat,
+  writeFileSync as write,
+} from "node:fs";
+import { dirname as dirOf, join as joinPath } from "node:path";
+import { fileURLToPath as urlToPath } from "node:url";
 
-// --- the bytes must be a real PNG of the right shape ---
-const buf = readFileSync(src);
-const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
-if (!buf.subarray(0, 8).equals(PNG_SIG)) {
-  throw new Error("entry.png is not a PNG");
-}
-const width = buf.readUInt32BE(16);
-const height = buf.readUInt32BE(20);
-if (width !== 1024 || height !== 1024) {
-  throw new Error(`entry.png must be 1024x1024, got ${width}x${height}`);
-}
-const size = statSync(src).size;
-if (size > 1_048_576) {
-  throw new Error(`entry.png exceeds 1,048,576 bytes (got ${size})`);
+const here = dirOf(urlToPath(import.meta.url));
+const pngPath = joinPath(here, "entry.png");
+const outDir = process.env.MAKEFUN_OUTPUT_DIR === undefined
+  ? "/output"
+  : process.env.MAKEFUN_OUTPUT_DIR;
+
+function die(message) {
+  throw new Error(message);
 }
 
-// --- every PNG chunk must be whole, with a matching CRC ---
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    table[n] = c >>> 0;
+// --- CRC-32, PNG flavour (polynomial 0xedb88320) ---
+function makeCrcTable() {
+  const crcTable = new Uint32Array(256);
+  for (let start = 0; start < crcTable.length; start++) {
+    let value = start;
+    for (let bit = 0; bit < 8; bit++) {
+      value = (value & 1) !== 0 ? 0xedb88320 ^ (value >>> 1) : value >>> 1;
+    }
+    crcTable[start] = value >>> 0;
   }
-  return table;
-})();
-function crc32(bytes) {
-  let c = 0xffffffff;
-  for (const b of bytes) c = CRC_TABLE[(c ^ b) & 0xff] ^ (c >>> 8);
-  return (c ^ 0xffffffff) >>> 0;
+  return crcTable;
 }
-let off = 8;
-let sawIEND = false;
-while (off + 8 <= buf.length) {
-  const len = buf.readUInt32BE(off);
-  const type = buf.toString("ascii", off + 4, off + 8);
-  if (off + 12 + len > buf.length) throw new Error(`PNG chunk ${type} is truncated`);
-  const stored = buf.readUInt32BE(off + 8 + len);
-  const actual = crc32(buf.subarray(off + 4, off + 8 + len));
-  if (stored !== actual) throw new Error(`PNG chunk ${type} has a bad CRC`);
-  off += 12 + len;
-  if (type === "IEND") {
-    sawIEND = true;
-    break;
-  }
-}
-if (!sawIEND) throw new Error("entry.png has no IEND chunk");
+const CRC = makeCrcTable();
 
-// --- copy + deterministic dossier (same bytes on every run) ---
-mkdirSync(outDir, { recursive: true });
-copyFileSync(src, join(outDir, "entry.png"));
-const dossier = {
-  title: "ONE DAY ON EARTH - Monday 23 November 2026",
-  competition: "news-image-20261123",
-  image: "entry.png",
-  width,
-  height,
-  bytes: size,
-  sha256: createHash("sha256").update(buf).digest("hex"),
-  stories: 35,
-  regions: 7,
-  pictured: 13,
-};
-writeFileSync(join(outDir, "dossier.json"), JSON.stringify(dossier, null, 2) + "\n");
-console.log(`wrote ${join(outDir, "entry.png")} (${size} bytes, sha256 ${dossier.sha256.slice(0, 16)}...)`);
+function crcOf(bytes) {
+  let running = 0xffffffff;
+  for (const byte of bytes) {
+    running = CRC[(running ^ byte) & 0xff] ^ (running >>> 8);
+  }
+  return (running ^ 0xffffffff) >>> 0;
+}
+
+// --- the file has to be a genuine PNG with the right dimensions ---
+const png = read(pngPath);
+const magic = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+if (!png.subarray(0, 8).equals(magic)) die("entry.png is not a PNG");
+
+const pngWidth = png.readUInt32BE(16);
+const pngHeight = png.readUInt32BE(20);
+if (pngWidth !== 1024 || pngHeight !== 1024) {
+  die(`entry.png must be 1024x1024, got ${pngWidth}x${pngHeight}`);
+}
+
+const pngBytes = stat(pngPath).size;
+if (pngBytes > 1_048_576) {
+  die(`entry.png exceeds 1,048,576 bytes (got ${pngBytes})`);
+}
+
+// --- walk the chunks, checking every CRC and finding IEND ---
+let cursor = 8;
+let foundIend = false;
+while (cursor + 8 <= png.length && !foundIend) {
+  const chunkLen = png.readUInt32BE(cursor);
+  const chunkType = png.toString("ascii", cursor + 4, cursor + 8);
+  if (cursor + 12 + chunkLen > png.length) {
+    die(`PNG chunk ${chunkType} is truncated`);
+  }
+  const storedCrc = png.readUInt32BE(cursor + 8 + chunkLen);
+  const realCrc = crcOf(png.subarray(cursor + 4, cursor + 8 + chunkLen));
+  if (storedCrc !== realCrc) die(`PNG chunk ${chunkType} has a bad CRC`);
+  cursor += 12 + chunkLen;
+  if (chunkType === "IEND") foundIend = true;
+}
+if (!foundIend) die("entry.png has no IEND chunk");
+
+// --- copy the image out and write the dossier (identical every run) ---
+mkdir(outDir, { recursive: true });
+const outPng = joinPath(outDir, "entry.png");
+copy(pngPath, outPng);
+
+const dossier = {};
+dossier.title = "ONE DAY ON EARTH - Monday 23 November 2026";
+dossier.competition = "news-image-20261123";
+dossier.image = "entry.png";
+dossier.width = pngWidth;
+dossier.height = pngHeight;
+dossier.bytes = pngBytes;
+dossier.sha256 = hashOf("sha256").update(png).digest("hex");
+dossier.stories = 35;
+dossier.regions = 7;
+dossier.pictured = 13;
+write(joinPath(outDir, "dossier.json"), JSON.stringify(dossier, null, 2) + "\n");
+
+console.log(`wrote ${outPng} (${pngBytes} bytes, sha256 ${dossier.sha256.slice(0, 16)}...)`);
